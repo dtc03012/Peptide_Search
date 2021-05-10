@@ -95,14 +95,13 @@ output_array = np.array(output_array)
 ATCH_SIZE = 64
 BUFFER_SIZE = 20000
 print(seq_mx_len)
-# 디코더의 실제값 시퀀스에서는 시작 토큰을 제거해야 한다.
 dataset = tf.data.Dataset.from_tensor_slices((
     {
         'inputs': input_array,
-        'dec_inputs': output_array[:, :-1] # 디코더의 입력. 마지막 패딩 토큰이 제거된다.
+        'dec_inputs': output_array[:, :-1]
     },
     {
-        'outputs': output_array[:, 1:]  # 맨 처음 토큰이 제거된다. 다시 말해 시작 토큰이 제거된다.
+        'outputs': output_array[:, 1:]
     },
 ))
 
