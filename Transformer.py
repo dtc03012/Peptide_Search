@@ -15,464 +15,329 @@ import tensorflow_text as text
 import tensorflow as tf
 
 
-def get_angles(pos, i, d_model):
-    angle_rates = 1 / np.power(10000, (2 * (i//2)) / np.float32(d_model))
-    return pos * angle_rates
+class PositionalEncoding(tf.keras.layers.Layer):
+    def __init__(self, position, d_model):
+        super(PositionalEncoding, self).__init__()
+        self.pos_encoding = self.positional_encoding(position, d_model)
 
-def positional_encoding(position, d_model):
-    angle_rads = get_angles(np.arange(position)[:, np.newaxis],
-                          np.arange(d_model)[np.newaxis, :],
-                          d_model)
+    def get_angles(self, position, i, d_model):
+        angles = 1 / tf.pow(10000, (2 * (i // 2)) / tf.cast(d_model, tf.float32))
+        return position * angles
 
-    # apply sin to even indices in the array; 2i
-    angle_rads[:, 0::2] = np.sin(angle_rads[:, 0::2])
+    def positional_encoding(self, position, d_model):
+        angle_rads = self.get_angles(
+            position=tf.range(position, dtype=tf.float32)[:, tf.newaxis],
+            i=tf.range(d_model, dtype=tf.float32)[tf.newaxis, :],
+            d_model=d_model)
 
-    # apply cos to odd indices in the array; 2i+1
-    angle_rads[:, 1::2] = np.cos(angle_rads[:, 1::2])
+        # 배열의 짝수 인덱스(2i)에는 사인 함수 적용
+        sines = tf.math.sin(angle_rads[:, 0::2])
 
-    pos_encoding = angle_rads[np.newaxis, ...]
+        # 배열의 홀수 인덱스(2i+1)에는 코사인 함수 적용
+        cosines = tf.math.cos(angle_rads[:, 1::2])
 
-    return tf.cast(pos_encoding, dtype=tf.float32)
+        angle_rads = np.zeros(angle_rads.shape)
+        angle_rads[:, 0::2] = sines
+        angle_rads[:, 1::2] = cosines
+        pos_encoding = tf.constant(angle_rads)
+        pos_encoding = pos_encoding[tf.newaxis, ...]
+
+        print(pos_encoding.shape)
+        return tf.cast(pos_encoding, tf.float32)
+
+    def call(self, inputs):
+        return inputs + self.pos_encoding[:, :tf.shape(inputs)[1], :]
 
 
-def create_padding_mask(seq):
-    seq = tf.cast(tf.math.equal(seq, 0), tf.float32)
-    print(seq)
-    # add extra dimensions to add the padding
-    # to the attention logits.
-    return seq[:, tf.newaxis, tf.newaxis, :]  # (batch_size, 1, 1, seq_len)
+def scaled_dot_product_attention(query, key, value, mask):
+  # query 크기 : (batch_size, num_heads, query의 문장 길이, d_model/num_heads)
+  # key 크기 : (batch_size, num_heads, key의 문장 길이, d_model/num_heads)
+  # value 크기 : (batch_size, num_heads, value의 문장 길이, d_model/num_heads)
+  # padding_mask : (batch_size, 1, 1, key의 문장 길이)
 
-def create_look_ahead_mask(size):
-    mask = 1 - tf.linalg.band_part(tf.ones((size, size)), -1, 0)
-    return mask  # (seq_len, seq_len)
+  # Q와 K의 곱. 어텐션 스코어 행렬.
+  matmul_qk = tf.matmul(query, key, transpose_b=True)
 
-def scaled_dot_product_attention(q, k, v, mask):
-    """Calculate the attention weights.
-    q, k, v must have matching leading dimensions.
-    k, v must have matching penultimate dimension, i.e.: seq_len_k = seq_len_v.
-    The mask has different shapes depending on its type(padding or look ahead)
-    but it must be broadcastable for addition.
+  # 스케일링
+  # dk의 루트값으로 나눠준다.
+  depth = tf.cast(tf.shape(key)[-1], tf.float32)
+  logits = matmul_qk / tf.math.sqrt(depth)
 
-    Args:
-    q: query shape == (..., seq_len_q, depth)
-    k: key shape == (..., seq_len_k, depth)
-    v: value shape == (..., seq_len_v, depth_v)
-    mask: Float tensor with shape broadcastable
-          to (..., seq_len_q, seq_len_k). Defaults to None.
+  # 마스킹. 어텐션 스코어 행렬의 마스킹 할 위치에 매우 작은 음수값을 넣는다.
+  # 매우 작은 값이므로 소프트맥스 함수를 지나면 행렬의 해당 위치의 값은 0이 된다.
+  if mask is not None:
+    logits += (mask * -1e9)
 
-    Returns:
-    output, attention_weights
-    """
+  # 소프트맥스 함수는 마지막 차원인 key의 문장 길이 방향으로 수행된다.
+  # attention weight : (batch_size, num_heads, query의 문장 길이, key의 문장 길이)
+  attention_weights = tf.nn.softmax(logits, axis=-1)
 
-    matmul_qk = tf.matmul(q, k, transpose_b=True)  # (..., seq_len_q, seq_len_k)
+  # output : (batch_size, num_heads, query의 문장 길이, d_model/num_heads)
+  output = tf.matmul(attention_weights, value)
 
-    # scale matmul_qk
-    dk = tf.cast(tf.shape(k)[-1], tf.float32)
-    scaled_attention_logits = matmul_qk / tf.math.sqrt(dk)
+  return output, attention_weights
 
-    # add the mask to the scaled tensor.
-    if mask is not None:
-        scaled_attention_logits += (mask * -1e9)
-
-    # softmax is normalized on the last axis (seq_len_k) so that the scores
-    # add up to 1.
-    attention_weights = tf.nn.softmax(scaled_attention_logits, axis=-1)  # (..., seq_len_q, seq_len_k)
-
-    output = tf.matmul(attention_weights, v)  # (..., seq_len_q, depth_v)
-
-    return output, attention_weights
+def create_padding_mask(x):
+  mask = tf.cast(tf.math.equal(x, 0), tf.float32)
+  # (batch_size, 1, 1, key의 문장 길이)
+  return mask[:, tf.newaxis, tf.newaxis, :]
 
 class MultiHeadAttention(tf.keras.layers.Layer):
-    def __init__(self, d_model, num_heads):
-        super(MultiHeadAttention, self).__init__()
-        self.num_heads = num_heads
-        self.d_model = d_model
 
-        assert d_model % self.num_heads == 0
-
-        self.depth = d_model // self.num_heads
-
-        self.wq = tf.keras.layers.Dense(d_model)
-        self.wk = tf.keras.layers.Dense(d_model)
-        self.wv = tf.keras.layers.Dense(d_model)
-
-        self.dense = tf.keras.layers.Dense(d_model)
-
-    def split_heads(self, x, batch_size):
-        """Split the last dimension into (num_heads, depth).
-        Transpose the result such that the shape is (batch_size, num_heads, seq_len, depth)
-        """
-        x = tf.reshape(x, (batch_size, -1, self.num_heads, self.depth))
-        return tf.transpose(x, perm=[0, 2, 1, 3])
-
-    def call(self, v, k, q, mask):
-        batch_size = tf.shape(q)[0]
-
-        q = self.wq(q)  # (batch_size, seq_len, d_model)
-        k = self.wk(k)  # (batch_size, seq_len, d_model)
-        v = self.wv(v)  # (batch_size, seq_len, d_model)
-
-        q = self.split_heads(q, batch_size)  # (batch_size, num_heads, seq_len_q, depth)
-        k = self.split_heads(k, batch_size)  # (batch_size, num_heads, seq_len_k, depth)
-        v = self.split_heads(v, batch_size)  # (batch_size, num_heads, seq_len_v, depth)
-
-        # scaled_attention.shape == (batch_size, num_heads, seq_len_q, depth)
-        # attention_weights.shape == (batch_size, num_heads, seq_len_q, seq_len_k)
-        scaled_attention, attention_weights = scaled_dot_product_attention(
-            q, k, v, mask)
-
-        scaled_attention = tf.transpose(scaled_attention, perm=[0, 2, 1, 3])  # (batch_size, seq_len_q, num_heads, depth)
-
-        concat_attention = tf.reshape(scaled_attention,
-                                      (batch_size, -1, self.d_model))  # (batch_size, seq_len_q, d_model)
-
-        output = self.dense(concat_attention)  # (batch_size, seq_len_q, d_model)
-
-        return output, attention_weights
-
-def point_wise_feed_forward_network(d_model, dff):
-    return tf.keras.Sequential([
-      tf.keras.layers.Dense(dff, activation='relu'),  # (batch_size, seq_len, dff)
-      tf.keras.layers.Dense(d_model)  # (batch_size, seq_len, d_model)
-    ])
-
-class EncoderLayer(tf.keras.layers.Layer):
-    def __init__(self, d_model, num_heads, dff, rate=0.1):
-        super(EncoderLayer, self).__init__()
-
-        self.mha = MultiHeadAttention(d_model, num_heads)
-        self.ffn = point_wise_feed_forward_network(d_model, dff)
-
-        self.layernorm1 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
-        self.layernorm2 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
-
-        self.dropout1 = tf.keras.layers.Dropout(rate)
-        self.dropout2 = tf.keras.layers.Dropout(rate)
-
-    def call(self, x, training, mask):
-
-        attn_output, _ = self.mha(x, x, x, mask)  # (batch_size, input_seq_len, d_model)
-        attn_output = self.dropout1(attn_output, training=training)
-        out1 = self.layernorm1(x + attn_output)  # (batch_size, input_seq_len, d_model)
-
-        ffn_output = self.ffn(out1)  # (batch_size, input_seq_len, d_model)
-        ffn_output = self.dropout2(ffn_output, training=training)
-        out2 = self.layernorm2(out1 + ffn_output)  # (batch_size, input_seq_len, d_model)
-
-        return out2
-
-
-class DecoderLayer(tf.keras.layers.Layer):
-    def __init__(self, d_model, num_heads, dff, rate=0.1):
-        super(DecoderLayer, self).__init__()
-
-        self.mha1 = MultiHeadAttention(d_model, num_heads)
-        self.mha2 = MultiHeadAttention(d_model, num_heads)
-
-        self.ffn = point_wise_feed_forward_network(d_model, dff)
-
-        self.layernorm1 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
-        self.layernorm2 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
-        self.layernorm3 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
-
-        self.dropout1 = tf.keras.layers.Dropout(rate)
-        self.dropout2 = tf.keras.layers.Dropout(rate)
-        self.dropout3 = tf.keras.layers.Dropout(rate)
-
-    def call(self, x, enc_output, training, look_ahead_mask, padding_mask):
-        # enc_output.shape == (batch_size, input_seq_len, d_model)
-
-        attn1, attn_weights_block1 = self.mha1(x, x, x, look_ahead_mask)  # (batch_size, target_seq_len, d_model)
-        attn1 = self.dropout1(attn1, training=training)
-        out1 = self.layernorm1(attn1 + x)
-
-        attn2, attn_weights_block2 = self.mha2(
-            enc_output, enc_output, out1, padding_mask)  # (batch_size, target_seq_len, d_model)
-        attn2 = self.dropout2(attn2, training=training)
-        out2 = self.layernorm2(attn2 + out1)  # (batch_size, target_seq_len, d_model)
-
-        ffn_output = self.ffn(out2)  # (batch_size, target_seq_len, d_model)
-        ffn_output = self.dropout3(ffn_output, training=training)
-        out3 = self.layernorm3(ffn_output + out2)  # (batch_size, target_seq_len, d_model)
-
-        return out3, attn_weights_block1, attn_weights_block2
-
-class Encoder(tf.keras.layers.Layer):
-    def __init__(self, num_layers, d_model, num_heads, dff, input_vocab_size, maximum_position_encoding, rate=0.1):
-        super(Encoder, self).__init__()
-
-        self.d_model = d_model
-        self.num_layers = num_layers
-
-        self.embedding = tf.keras.layers.Embedding(input_vocab_size, d_model)
-        self.pos_encoding = positional_encoding(maximum_position_encoding,
-                                                self.d_model)
-
-        self.enc_layers = [EncoderLayer(d_model, num_heads, dff, rate)
-                           for _ in range(num_layers)]
-
-        self.dropout = tf.keras.layers.Dropout(rate)
-
-    def call(self, x, training, mask):
-
-        seq_len = tf.shape(x)[1]
-
-        # adding embedding and position encoding.
-        x = self.embedding(x)  # (batch_size, input_seq_len, d_model)
-        x *= tf.math.sqrt(tf.cast(self.d_model, tf.float32))
-        x += self.pos_encoding[:, :seq_len, :]
-
-        x = self.dropout(x, training=training)
-
-        for i in range(self.num_layers):
-          x = self.enc_layers[i](x, training, mask)
-
-        return x  # (batch_size, input_seq_len, d_model)
-
-
-
-class Decoder(tf.keras.layers.Layer):
-    def __init__(self, num_layers, d_model, num_heads, dff, target_vocab_size, maximum_position_encoding, rate=0.1):
-        super(Decoder, self).__init__()
-
-        self.d_model = d_model
-        self.num_layers = num_layers
-
-        self.embedding = tf.keras.layers.Embedding(target_vocab_size, d_model)
-        self.pos_encoding = positional_encoding(maximum_position_encoding, d_model)
-
-        self.dec_layers = [DecoderLayer(d_model, num_heads, dff, rate)
-                           for _ in range(num_layers)]
-        self.dropout = tf.keras.layers.Dropout(rate)
-
-    def call(self, x, enc_output, training, look_ahead_mask, padding_mask):
-
-        seq_len = tf.shape(x)[1]
-        attention_weights = {}
-
-        x = self.embedding(x)  # (batch_size, target_seq_len, d_model)
-        x *= tf.math.sqrt(tf.cast(self.d_model, tf.float32))
-        x += self.pos_encoding[:, :seq_len, :]
-
-        x = self.dropout(x, training=training)
-
-        for i in range(self.num_layers):
-              x, block1, block2 = self.dec_layers[i](x, enc_output, training,
-                                                     look_ahead_mask, padding_mask)
-
-              attention_weights[f'decoder_layer{i+1}_block1'] = block1
-              attention_weights[f'decoder_layer{i+1}_block2'] = block2
-
-        # x.shape == (batch_size, target_seq_len, d_model)
-        return x, attention_weights
-
-
-class Transformer(tf.keras.Model):
-    def __init__(self, num_layers, d_model, num_heads, dff, input_vocab_size, target_vocab_size, pe_input, pe_target, rate=0.1):
-        super(Transformer, self).__init__()
-
-        self.tokenizer = Encoder(num_layers, d_model, num_heads, dff,
-                                 input_vocab_size, pe_input, rate)
-
-        self.decoder = Decoder(num_layers, d_model, num_heads, dff,
-                               target_vocab_size, pe_target, rate)
-
-        self.final_layer = tf.keras.layers.Dense(target_vocab_size)
-
-    def call(self, inp, tar, training, enc_padding_mask, look_ahead_mask, dec_padding_mask):
-
-        enc_output = self.tokenizer(inp, training, enc_padding_mask)  # (batch_size, inp_seq_len, d_model)
-
-        # dec_output.shape == (batch_size, tar_seq_len, d_model)
-        dec_output, attention_weights = self.decoder(
-            tar, enc_output, training, look_ahead_mask, dec_padding_mask)
-
-        final_output = self.final_layer(dec_output)  # (batch_size, tar_seq_len, target_vocab_size)
-
-        return final_output, attention_weights
+  def __init__(self, d_model, num_heads, name="multi_head_attention"):
+    super(MultiHeadAttention, self).__init__(name=name)
+    self.num_heads = num_heads
+    self.d_model = d_model
+
+    assert d_model % self.num_heads == 0
+
+    # d_model을 num_heads로 나눈 값.
+    # 논문 기준 : 64
+    self.depth = d_model // self.num_heads
+
+    # WQ, WK, WV에 해당하는 밀집층 정의
+    self.query_dense = tf.keras.layers.Dense(units=d_model)
+    self.key_dense = tf.keras.layers.Dense(units=d_model)
+    self.value_dense = tf.keras.layers.Dense(units=d_model)
+
+    # WO에 해당하는 밀집층 정의
+    self.dense = tf.keras.layers.Dense(units=d_model)
+
+  # num_heads 개수만큼 q, k, v를 split하는 함수
+  def split_heads(self, inputs, batch_size):
+    inputs = tf.reshape(
+        inputs, shape=(batch_size, -1, self.num_heads, self.depth))
+    return tf.transpose(inputs, perm=[0, 2, 1, 3])
+
+  def call(self, inputs):
+    query, key, value, mask = inputs['query'], inputs['key'], inputs[
+        'value'], inputs['mask']
+    batch_size = tf.shape(query)[0]
+
+    # 1. WQ, WK, WV에 해당하는 밀집층 지나기
+    # q : (batch_size, query의 문장 길이, d_model)
+    # k : (batch_size, key의 문장 길이, d_model)
+    # v : (batch_size, value의 문장 길이, d_model)
+    # 참고) 인코더(k, v)-디코더(q) 어텐션에서는 query 길이와 key, value의 길이는 다를 수 있다.
+    query = self.query_dense(query)
+    key = self.key_dense(key)
+    value = self.value_dense(value)
+
+    # 2. 헤드 나누기
+    # q : (batch_size, num_heads, query의 문장 길이, d_model/num_heads)
+    # k : (batch_size, num_heads, key의 문장 길이, d_model/num_heads)
+    # v : (batch_size, num_heads, value의 문장 길이, d_model/num_heads)
+    query = self.split_heads(query, batch_size)
+    key = self.split_heads(key, batch_size)
+    value = self.split_heads(value, batch_size)
+
+    # 3. 스케일드 닷 프로덕트 어텐션. 앞서 구현한 함수 사용.
+    # (batch_size, num_heads, query의 문장 길이, d_model/num_heads)
+    scaled_attention, _ = scaled_dot_product_attention(query, key, value, mask)
+    # (batch_size, query의 문장 길이, num_heads, d_model/num_heads)
+    scaled_attention = tf.transpose(scaled_attention, perm=[0, 2, 1, 3])
+
+    # 4. 헤드 연결(concatenate)하기
+    # (batch_size, query의 문장 길이, d_model)
+    concat_attention = tf.reshape(scaled_attention,
+                                  (batch_size, -1, self.d_model))
+
+    # 5. WO에 해당하는 밀집층 지나기
+    # (batch_size, query의 문장 길이, d_model)
+    outputs = self.dense(concat_attention)
+
+    return outputs
+
+def create_padding_mask(x):
+  mask = tf.cast(tf.math.equal(x, 0), tf.float32)
+  # (batch_size, 1, 1, key의 문장 길이)
+  return mask[:, tf.newaxis, tf.newaxis, :]
+
+def encoder_layer(dff, d_model, num_heads, dropout, name="encoder_layer"):
+  inputs = tf.keras.Input(shape=(None, d_model), name="inputs")
+
+  # 인코더는 패딩 마스크 사용
+  padding_mask = tf.keras.Input(shape=(1, 1, None), name="padding_mask")
+
+  # 멀티-헤드 어텐션 (첫번째 서브층 / 셀프 어텐션)
+  attention = MultiHeadAttention(
+      d_model, num_heads, name="attention")({
+      'query': inputs, 'key': inputs, 'value': inputs,  # Q = K = V
+      'mask': padding_mask  # 패딩 마스크 사용
+  })
+
+  # 드롭아웃 + 잔차 연결과 층 정규화
+  attention = tf.keras.layers.Dropout(rate=dropout)(attention)
+  attention = tf.keras.layers.LayerNormalization(
+      epsilon=1e-6)(inputs + attention)
+
+  # 포지션 와이즈 피드 포워드 신경망 (두번째 서브층)
+  outputs = tf.keras.layers.Dense(units=dff, activation='relu')(attention)
+  outputs = tf.keras.layers.Dense(units=d_model)(outputs)
+
+  # 드롭아웃 + 잔차 연결과 층 정규화
+  outputs = tf.keras.layers.Dropout(rate=dropout)(outputs)
+  outputs = tf.keras.layers.LayerNormalization(
+      epsilon=1e-6)(attention + outputs)
+
+  return tf.keras.Model(
+      inputs=[inputs, padding_mask], outputs=outputs, name=name)
+
+def encoder(vocab_size, num_layers, dff,
+          d_model, num_heads, dropout,
+          name="encoder"):
+  inputs = tf.keras.Input(shape=(None,), name="inputs")
+
+  # 인코더는 패딩 마스크 사용
+  padding_mask = tf.keras.Input(shape=(1, 1, None), name="padding_mask")
+
+  # 포지셔널 인코딩 + 드롭아웃
+  embeddings = tf.keras.layers.Embedding(vocab_size, d_model)(inputs)
+  embeddings *= tf.math.sqrt(tf.cast(d_model, tf.float32))
+  embeddings = PositionalEncoding(vocab_size, d_model)(embeddings)
+  outputs = tf.keras.layers.Dropout(rate=dropout)(embeddings)
+
+  # 인코더를 num_layers개 쌓기
+  for i in range(num_layers):
+      outputs = encoder_layer(dff=dff, d_model=d_model, num_heads=num_heads,
+                              dropout=dropout, name="encoder_layer_{}".format(i),
+                              )([outputs, padding_mask])
+
+  return tf.keras.Model(
+      inputs=[inputs, padding_mask], outputs=outputs, name=name)
+
+def create_look_ahead_mask(x):
+  seq_len = tf.shape(x)[1]
+  look_ahead_mask = 1 - tf.linalg.band_part(tf.ones((seq_len, seq_len)), -1, 0)
+  padding_mask = create_padding_mask(x)  # 패딩 마스크도 포함
+  return tf.maximum(look_ahead_mask, padding_mask)
+
+def decoder_layer(dff, d_model, num_heads, dropout, name="decoder_layer"):
+  inputs = tf.keras.Input(shape=(None, d_model), name="inputs")
+  enc_outputs = tf.keras.Input(shape=(None, d_model), name="encoder_outputs")
+
+  # 룩어헤드 마스크(첫번째 서브층)
+  look_ahead_mask = tf.keras.Input(
+      shape=(1, None, None), name="look_ahead_mask")
+
+  # 패딩 마스크(두번째 서브층)
+  padding_mask = tf.keras.Input(shape=(1, 1, None), name='padding_mask')
+
+  # 멀티-헤드 어텐션 (첫번째 서브층 / 마스크드 셀프 어텐션)
+  attention1 = MultiHeadAttention(
+      d_model, num_heads, name="attention_1")(inputs={
+      'query': inputs, 'key': inputs, 'value': inputs,  # Q = K = V
+      'mask': look_ahead_mask  # 룩어헤드 마스크
+  })
+
+  # 잔차 연결과 층 정규화
+  attention1 = tf.keras.layers.LayerNormalization(
+      epsilon=1e-6)(attention1 + inputs)
+
+  # 멀티-헤드 어텐션 (두번째 서브층 / 디코더-인코더 어텐션)
+  attention2 = MultiHeadAttention(
+      d_model, num_heads, name="attention_2")(inputs={
+      'query': attention1, 'key': enc_outputs, 'value': enc_outputs,  # Q != K = V
+      'mask': padding_mask  # 패딩 마스크
+  })
+
+  # 드롭아웃 + 잔차 연결과 층 정규화
+  attention2 = tf.keras.layers.Dropout(rate=dropout)(attention2)
+  attention2 = tf.keras.layers.LayerNormalization(
+      epsilon=1e-6)(attention2 + attention1)
+
+  # 포지션 와이즈 피드 포워드 신경망 (세번째 서브층)
+  outputs = tf.keras.layers.Dense(units=dff, activation='relu')(attention2)
+  outputs = tf.keras.layers.Dense(units=d_model)(outputs)
+
+  # 드롭아웃 + 잔차 연결과 층 정규화
+  outputs = tf.keras.layers.Dropout(rate=dropout)(outputs)
+  outputs = tf.keras.layers.LayerNormalization(
+      epsilon=1e-6)(outputs + attention2)
+
+  return tf.keras.Model(
+      inputs=[inputs, enc_outputs, look_ahead_mask, padding_mask],
+      outputs=outputs,
+      name=name)
+
+def decoder(vocab_size, num_layers, dff,
+          d_model, num_heads, dropout,
+          name='decoder'):
+  inputs = tf.keras.Input(shape=(None,), name='inputs')
+  enc_outputs = tf.keras.Input(shape=(None, d_model), name='encoder_outputs')
+
+  # 디코더는 룩어헤드 마스크(첫번째 서브층)와 패딩 마스크(두번째 서브층) 둘 다 사용.
+  look_ahead_mask = tf.keras.Input(
+      shape=(1, None, None), name='look_ahead_mask')
+  padding_mask = tf.keras.Input(shape=(1, 1, None), name='padding_mask')
+
+  # 포지셔널 인코딩 + 드롭아웃
+  embeddings = tf.keras.layers.Embedding(vocab_size, d_model)(inputs)
+  embeddings *= tf.math.sqrt(tf.cast(d_model, tf.float32))
+  embeddings = PositionalEncoding(vocab_size, d_model)(embeddings)
+  outputs = tf.keras.layers.Dropout(rate=dropout)(embeddings)
+
+  # 디코더를 num_layers개 쌓기
+  for i in range(num_layers):
+      outputs = decoder_layer(dff=dff, d_model=d_model, num_heads=num_heads,
+                              dropout=dropout, name='decoder_layer_{}'.format(i),
+                              )(inputs=[outputs, enc_outputs, look_ahead_mask, padding_mask])
+
+  return tf.keras.Model(
+      inputs=[inputs, enc_outputs, look_ahead_mask, padding_mask],
+      outputs=outputs,
+      name=name)
+
+def transformer(vocab_size, num_layers, dff,
+              d_model, num_heads, dropout,
+              name="transformer"):
+
+  # 인코더의 입력
+  inputs = tf.keras.Input(shape=(None,), name="inputs")
+
+  # 디코더의 입력
+  dec_inputs = tf.keras.Input(shape=(None,), name="dec_inputs")
+
+  # 인코더의 패딩 마스크
+  enc_padding_mask = tf.keras.layers.Lambda(
+      create_padding_mask, output_shape=(1, 1, None),
+      name='enc_padding_mask')(inputs)
+
+  # 디코더의 룩어헤드 마스크(첫번째 서브층)
+  look_ahead_mask = tf.keras.layers.Lambda(
+      create_look_ahead_mask, output_shape=(1, None, None),
+      name='look_ahead_mask')(dec_inputs)
+
+  # 디코더의 패딩 마스크(두번째 서브층)
+  dec_padding_mask = tf.keras.layers.Lambda(
+      create_padding_mask, output_shape=(1, 1, None),
+      name='dec_padding_mask')(inputs)
+
+  # 인코더의 출력은 enc_outputs. 디코더로 전달된다.
+  enc_outputs = encoder(vocab_size=vocab_size, num_layers=num_layers, dff=dff,
+                        d_model=d_model, num_heads=num_heads, dropout=dropout,
+                        )(inputs=[inputs, enc_padding_mask])  # 인코더의 입력은 입력 문장과 패딩 마스크
+
+  # 디코더의 출력은 dec_outputs. 출력층으로 전달된다.
+  dec_outputs = decoder(vocab_size=vocab_size, num_layers=num_layers, dff=dff,
+                        d_model=d_model, num_heads=num_heads, dropout=dropout,
+                        )(inputs=[dec_inputs, enc_outputs, look_ahead_mask, dec_padding_mask])
+
+  # 다음 단어 예측을 위한 출력층
+  outputs = tf.keras.layers.Dense(units=vocab_size, name="outputs")(dec_outputs)
+
+  return tf.keras.Model(inputs=[inputs, dec_inputs], outputs=outputs, name=name)
 
 class CustomSchedule(tf.keras.optimizers.schedules.LearningRateSchedule):
+
   def __init__(self, d_model, warmup_steps=4000):
     super(CustomSchedule, self).__init__()
-
     self.d_model = d_model
     self.d_model = tf.cast(self.d_model, tf.float32)
-
     self.warmup_steps = warmup_steps
 
   def __call__(self, step):
     arg1 = tf.math.rsqrt(step)
-    arg2 = step * (self.warmup_steps ** -1.5)
+    arg2 = step * (self.warmup_steps**-1.5)
 
     return tf.math.rsqrt(self.d_model) * tf.math.minimum(arg1, arg2)
-
-train_step_signature = [
-        tf.TensorSpec(shape=(None, None), dtype=tf.int64),
-        tf.TensorSpec(shape=(None, None), dtype=tf.int64),
-    ]
-class train:
-    def __init__(self,num_layers,d_model,dff,num_heads,dropout_rate,input_size,target_size,epoch):
-        self.train_loss = tf.keras.metrics.Mean(name='train_loss')
-        self.train_accuracy = tf.keras.metrics.Mean(name='train_accuracy')
-        self.num_layers = num_layers
-        self.d_model = d_model
-        self.dff = dff
-        self.num_heads = num_heads
-        self.dropout_rate = dropout_rate
-        self.input_size = input_size
-        self.target_size = target_size
-        self.Epochs = self.epoch
-        self.train_loss = tf.keras.metrics.Mean(name='train_loss')
-        self.train_accuracy = tf.keras.metrics.Mean(name='train_accuracy')
-        self.loss_object = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True, reduction='none')
-        self.learning_rate = CustomSchedule(d_model)
-        self.optimizer = tf.keras.optimizers.Adam(self.learning_rate, beta_1=0.9, beta_2=0.98,
-                                             epsilon=1e-9)
-        checkpoint_path = "./checkpoints/train"
-        self.transformer = Transformer(
-            num_layers=num_layers,
-            d_model=d_model,
-            num_heads=num_heads,
-            dff=dff,
-            input_vocab_size=self.input_size,
-            target_vocab_size=self.target_size,
-            pe_input=1000,
-            pe_target=1000,
-            rate=dropout_rate)
-
-        checkpoint_path = "./checkpoints/train"
-
-        self.ckpt = tf.train.Checkpoint(transformer=self.transformer,
-                                   optimizer=self.optimizer)
-
-        ckpt_manager = tf.train.CheckpointManager(self.ckpt, checkpoint_path, max_to_keep=5)
-
-        # if a checkpoint exists, restore the latest checkpoint.
-        if ckpt_manager.latest_checkpoint:
-            self.ckpt.restore(ckpt_manager.latest_checkpoint)
-            print('Latest checkpoint restored!!')
-
-    def loss_function(self,real, pred):
-        mask = tf.math.logical_not(tf.math.equal(real, 0))
-        loss_ = self.loss_object(real, pred)
-
-        mask = tf.cast(mask, dtype=loss_.dtype)
-        loss_ *= mask
-
-        return tf.reduce_sum(loss_) / tf.reduce_sum(mask)
-
-    def accuracy_function(self,real, pred):
-        accuracies = tf.equal(real, tf.argmax(pred, axis=2))
-
-        mask = tf.math.logical_not(tf.math.equal(real, 0))
-        accuracies = tf.math.logical_and(mask, accuracies)
-
-        accuracies = tf.cast(accuracies, dtype=tf.float32)
-        mask = tf.cast(mask, dtype=tf.float32)
-        return tf.reduce_sum(accuracies) / tf.reduce_sum(mask)
-
-    def create_masks(self, inp, tar):
-        # Encoder padding mask
-        enc_padding_mask = create_padding_mask(inp)
-
-        # Used in the 2nd attention block in the decoder.
-        # This padding mask is used to mask the encoder outputs.
-        dec_padding_mask = create_padding_mask(inp)
-
-        # Used in the 1st attention block in the decoder.
-        # It is used to pad and mask future tokens in the input received by
-        # the decoder.
-        look_ahead_mask = create_look_ahead_mask(tf.shape(tar)[1])
-        dec_target_padding_mask = create_padding_mask(tar)
-        combined_mask = tf.maximum(dec_target_padding_mask, look_ahead_mask)
-
-        return enc_padding_mask, combined_mask, dec_padding_mask
-
-    @tf.function(input_signature=train_step_signature)
-    def train_step(self, inp, tar):
-        tar_inp = tar[:, :-1]
-        tar_real = tar[:, 1:]
-
-        enc_padding_mask, combined_mask, dec_padding_mask = self.create_masks(inp, tar_inp)
-
-        with tf.GradientTape() as tape:
-            predictions, _ = self.transformer(inp, tar_inp,
-                                         True,
-                                         enc_padding_mask,
-                                         combined_mask,
-                                         dec_padding_mask)
-            loss = self.loss_function(tar_real, predictions)
-
-        gradients = tape.gradient(loss, self.transformer.trainable_variables)
-        self.optimizer.apply_gradients(zip(gradients, self.transformer.trainable_variables))
-
-        self.train_loss(loss)
-        self.train_accuracy(self.accuracy_function(tar_real, predictions))
-
-    def go(self,inp, tar):
-        for epoch in range(self.Epochs):
-            start = time.time()
-
-            self.train_loss.reset_states()
-            self.train_accuracy.reset_states()
-
-            # inp -> portuguese, tar -> english
-            for (batch, (inp, tar)) in enumerate(self.train_batches):
-                self.train_step(inp, tar)
-
-                if batch % 50 == 0:
-                    print(
-                        f'Epoch {epoch + 1} Batch {batch} Loss {self.train_loss.result():.4f} Accuracy {self.train_accuracy.result():.4f}')
-
-            if (epoch + 1) % 5 == 0:
-                ckpt_save_path = self.ckpt_manager.save()
-                print(f'Saving checkpoint for epoch {epoch + 1} at {ckpt_save_path}')
-
-            print(f'Epoch {epoch + 1} Loss {self.train_loss.result():.4f} Accuracy {self.train_accuracy.result():.4f}')
-
-            print(f'Time taken for 1 epoch: {time.time() - start:.2f} secs\n')
-
-    def evaluate(self,sentence, max_length=40):
-        # inp sentence is portuguese, hence adding the start and end token
-        sentence = tf.convert_to_tensor([sentence])
-        sentence = tokenizers.pt.tokenize(sentence).to_tensor()
-
-        encoder_input = sentence
-
-        # as the target is english, the first word to the transformer should be the
-        # english start token.
-        start, end = tokenizers.en.tokenize([''])[0]
-        output = tf.convert_to_tensor([start])
-        output = tf.expand_dims(output, 0)
-
-        for i in range(max_length):
-            enc_padding_mask, combined_mask, dec_padding_mask = self.create_masks(
-                encoder_input, output)
-
-            # predictions.shape == (batch_size, seq_len, vocab_size)
-            predictions, attention_weights = self.transformer(encoder_input,
-                                                         output,
-                                                         False,
-                                                         enc_padding_mask,
-                                                         combined_mask,
-                                                         dec_padding_mask)
-
-            # select the last word from the seq_len dimension
-            predictions = predictions[:, -1:, :]  # (batch_size, 1, vocab_size)
-
-            predicted_id = tf.argmax(predictions, axis=-1)
-
-            # concatentate the predicted_id to the output which is given to the decoder
-            # as its input.
-            output = tf.concat([output, predicted_id], axis=-1)
-
-            # return the result if the predicted_id is equal to the end token
-            if predicted_id == end:
-                break
-
-        # output.shape (1, tokens)
-        text = tokenizers.en.detokenize(output)[0]  # shape: ()
-
-        tokens = tokenizers.en.lookup(output)[0]
-
-        return text, tokens, attention_weights
